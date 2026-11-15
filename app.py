@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
+import requests
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
@@ -72,33 +73,93 @@ div[data-testid="stPills"] button { border-radius: 999px !important; }
 st.markdown(CSS, unsafe_allow_html=True)
 
 # --------------------------------------------------------------------------- #
-# Watchlist persistence
-#   1) URL query param  ?w=NPN.JO,SOL.JO   (bookmark-able, works across devices)
-#   2) watchlist.json next to app.py       (survives page refreshes on one host)
+# Persistence
+#   Preferred: a private GitHub Gist (survives app restarts, shared across devices).
+#     Set in Streamlit secrets:  GIST_ID = "..."   GITHUB_TOKEN = "github_pat_..."
+#   Fallback: URL query param ?w=... plus a JSON file next to app.py (lost on redeploy).
 # --------------------------------------------------------------------------- #
-WL_FILE = Path(__file__).with_name("watchlist.json")
 DEFAULT_WATCHLIST = ["NPN.JO", "SOL.JO", "SBK.JO", "AGL.JO", "AAPL", "MSFT"]
+WL_NAME, HEPS_NAME = "watchlist.json", "heps.json"
+
+
+def _gist_cfg():
+    try:
+        gid, tok = st.secrets["GIST_ID"], st.secrets["GITHUB_TOKEN"]
+        return (gid, tok) if gid and tok else None
+    except Exception:
+        return None
+
+
+def _gh_headers(tok: str) -> dict:
+    return {"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28"}
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _gist_files(gid: str, tok: str) -> dict:
+    r = requests.get(f"https://api.github.com/gists/{gid}", headers=_gh_headers(tok), timeout=10)
+    r.raise_for_status()
+    return {name: f.get("content", "") for name, f in r.json().get("files", {}).items()}
+
+
+def _gist_put(gid: str, tok: str, name: str, content: str) -> None:
+    r = requests.patch(f"https://api.github.com/gists/{gid}", headers=_gh_headers(tok),
+                       json={"files": {name: {"content": content}}}, timeout=10)
+    r.raise_for_status()
+    _gist_files.clear()
+
+
+def store_load(name: str, default):
+    """Read a JSON document from the gist, else from local disk, else default."""
+    cfg = _gist_cfg()
+    if cfg:
+        try:
+            raw = _gist_files(*cfg).get(name)
+            if raw:
+                return json.loads(raw)
+        except Exception as e:
+            st.session_state["store_error"] = f"Gist read failed: {e}"
+    try:
+        return json.loads(Path(__file__).with_name(name).read_text())
+    except Exception:
+        return default
+
+
+def store_save(name: str, data) -> bool:
+    """Write a JSON document to the gist (if configured) and to local disk. Returns True if durable."""
+    payload = json.dumps(data, indent=2)
+    durable = False
+    cfg = _gist_cfg()
+    if cfg:
+        try:
+            _gist_put(*cfg, name, payload)
+            durable = True
+        except Exception as e:
+            st.session_state["store_error"] = f"Gist write failed: {e}"
+    try:
+        Path(__file__).with_name(name).write_text(payload)
+    except Exception:
+        pass
+    return durable
 
 
 def _load_watchlist() -> list[str]:
+    if _gist_cfg():
+        data = store_load(WL_NAME, None)
+        if isinstance(data, list) and data:
+            return [str(s).upper() for s in data]
     q = st.query_params.get("w")
     if q:
         return [s.strip().upper() for s in q.split(",") if s.strip()]
-    try:
-        data = json.loads(WL_FILE.read_text())
-        if isinstance(data, list) and data:
-            return [str(s).upper() for s in data]
-    except Exception:
-        pass
+    data = store_load(WL_NAME, None)
+    if isinstance(data, list) and data:
+        return [str(s).upper() for s in data]
     return DEFAULT_WATCHLIST.copy()
 
 
 def _save_watchlist(wl: list[str]) -> None:
     st.query_params["w"] = ",".join(wl)
-    try:
-        WL_FILE.write_text(json.dumps(wl, indent=2))
-    except Exception:
-        pass  # read-only filesystem on some hosts – the URL still carries the list
+    store_save(WL_NAME, wl)
 
 
 if "watchlist" not in st.session_state:
@@ -121,41 +182,73 @@ PERIODS = {
 }
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def get_quote(symbol: str) -> dict:
+    """Live quote (fast_info) + last trade time (1-min bars) + previous-session figures (daily bars)."""
     t = yf.Ticker(symbol)
-    hist = t.history(period="10d", interval="1d", auto_adjust=False)
-    hist = hist.dropna(subset=["Close"])
-    if hist.empty:
-        raise ValueError(f"No price data for {symbol}")
-    today, prev = hist.iloc[-1], (hist.iloc[-2] if len(hist) > 1 else hist.iloc[-1])
+
+    # --- live quote fields -------------------------------------------------
     fi = {}
     try:
-        fi = {
-            "last": t.fast_info.last_price,
-            "currency": t.fast_info.currency,
-            "exchange": t.fast_info.exchange,
-        }
+        f = t.fast_info
+        fi = {k: _f(getattr(f, k, None)) for k in
+              ("last_price", "open", "day_high", "day_low", "last_volume", "previous_close")}
+        fi["currency"] = getattr(f, "currency", "") or ""
+        fi["exchange"] = getattr(f, "exchange", "") or ""
     except Exception:
         pass
-    last = fi.get("last")
-    if last is None or (isinstance(last, float) and math.isnan(last)):
-        last = float(today["Close"])
+
+    # --- today's intraday bars: last trade time + fallbacks -----------------
+    intra = pd.DataFrame()
+    try:
+        intra = t.history(period="1d", interval="1m", auto_adjust=False).dropna(subset=["Close"])
+    except Exception:
+        pass
+
+    # --- daily bars: previous session --------------------------------------
+    daily = t.history(period="10d", interval="1d", auto_adjust=False).dropna(subset=["Close"])
+    if daily.empty and intra.empty:
+        raise ValueError(f"No price data for {symbol}")
+
+    if not intra.empty:
+        as_of = intra.index[-1]
+        agg = {"open": float(intra["Open"].iloc[0]), "high": float(intra["High"].max()),
+               "low": float(intra["Low"].min()), "volume": float(intra["Volume"].sum()),
+               "last": float(intra["Close"].iloc[-1])}
+    else:
+        as_of = daily.index[-1]
+        row = daily.iloc[-1]
+        agg = {"open": float(row["Open"]), "high": float(row["High"]), "low": float(row["Low"]),
+               "volume": float(row["Volume"]), "last": float(row["Close"])}
+
+    # previous session = last daily bar strictly before the trade date
+    trade_date = as_of.date()
+    before = daily[[d.date() < trade_date for d in daily.index]]
+    prev = before.iloc[-1] if not before.empty else None
+
+    def pick(key_fi, key_agg):
+        v = fi.get(key_fi)
+        return v if v is not None else agg[key_agg]
+
+    prev_close = fi.get("previous_close")
+    if prev_close is None and prev is not None:
+        prev_close = float(prev["Close"])
+
     return {
         "symbol": symbol,
-        "last": float(last),
-        "currency": fi.get("currency") or "",
-        "exchange": fi.get("exchange") or "",
-        "as_of": hist.index[-1].to_pydatetime(),
-        "open": float(today["Open"]),
-        "high": float(today["High"]),
-        "low": float(today["Low"]),
-        "volume": float(today["Volume"]),
-        "prev_close": float(prev["Close"]),
-        "prev_high": float(prev["High"]),
-        "prev_low": float(prev["Low"]),
-        "prev_volume": float(prev["Volume"]),
-        "prev_date": hist.index[-2].to_pydatetime() if len(hist) > 1 else None,
+        "last": pick("last_price", "last"),
+        "currency": fi.get("currency", ""),
+        "exchange": fi.get("exchange", ""),
+        "as_of": as_of.to_pydatetime(),
+        "open": pick("open", "open"),
+        "high": pick("day_high", "high"),
+        "low": pick("day_low", "low"),
+        "volume": pick("last_volume", "volume"),
+        "prev_close": prev_close if prev_close is not None else agg["last"],
+        "prev_high": float(prev["High"]) if prev is not None else None,
+        "prev_low": float(prev["Low"]) if prev is not None else None,
+        "prev_volume": float(prev["Volume"]) if prev is not None else None,
+        "prev_date": prev.name.to_pydatetime() if prev is not None else None,
     }
 
 
@@ -362,7 +455,14 @@ with st.sidebar:
     if st.button("↻ Refresh data", width="stretch"):
         st.cache_data.clear()
         st.rerun()
-    st.caption("Tip: bookmark this page — your watchlist is saved in the link.")
+    if _gist_cfg():
+        if st.session_state.get("store_error"):
+            st.error(st.session_state["store_error"])
+        else:
+            st.caption("✅ Watchlist saved to your private Gist — synced across devices.")
+    else:
+        st.warning("Storage not configured: changes are lost when the app restarts. "
+                   "See README → 'Keep your watchlist'.")
 
 # --------------------------------------------------------------------------- #
 # Watchlist selector
@@ -397,41 +497,58 @@ except Exception as e:
     st.error(f"Couldn't load **{sym}**: {e}. Check the ticker (JSE shares need the `.JO` suffix).")
     st.stop()
 
-ccy, last = norm_currency(qd["currency"], qd["last"])
-_, open_ = norm_currency(qd["currency"], qd["open"])
-_, high = norm_currency(qd["currency"], qd["high"])
-_, low = norm_currency(qd["currency"], qd["low"])
-_, prev_close = norm_currency(qd["currency"], qd["prev_close"])
-_, prev_high = norm_currency(qd["currency"], qd["prev_high"])
-_, prev_low = norm_currency(qd["currency"], qd["prev_low"])
-chg = last - prev_close
-pct = (chg / prev_close * 100) if prev_close else 0.0
-d = css_dir(chg)
-prev_date = qd["prev_date"].strftime("%a %d %b") if qd["prev_date"] else "prev. session"
+QUOTE_REFRESH_SECONDS = 60
 
-meta_bits = [b for b in (qd["exchange"], prof["sector"], prof["industry"]) if b]
-st.markdown(
-    f"""
-    <div class="ps-card">
-      <p class="ps-name">{prof['name']} <span class="ps-meta">· {sym}</span></p>
-      <div class="ps-meta">{' · '.join(meta_bits)} · as of {qd['as_of'].strftime('%a %d %b %Y')}</div>
-      <div style="display:flex;align-items:baseline;gap:1rem;flex-wrap:wrap;margin-top:.6rem;">
-        <div class="ps-price">{fmt_price(last, ccy)}</div>
-        <div class="ps-chg {d}">{arrow(chg)} {chg:+,.2f} ({pct:+.2f}%) today</div>
-      </div>
-      <div class="ps-grid" style="margin-top:1rem;">
-        <div class="ps-tile"><div class="k">Open</div><div class="v">{fmt_price(open_, '')}</div></div>
-        <div class="ps-tile"><div class="k">Day high</div><div class="v up">{fmt_price(high, '')}</div></div>
-        <div class="ps-tile"><div class="k">Day low</div><div class="v down">{fmt_price(low, '')}</div></div>
-        <div class="ps-tile"><div class="k">Volume today</div><div class="v">{fmt_int(qd['volume'])}</div></div>
-        <div class="ps-tile"><div class="k">Prev. close</div><div class="v">{fmt_price(prev_close, '')}</div><div class="s">{prev_date}</div></div>
-        <div class="ps-tile"><div class="k">Prev. high / low</div><div class="v">{fmt_price(prev_high, '')} / {fmt_price(prev_low, '')}</div><div class="s">{prev_date}</div></div>
-        <div class="ps-tile"><div class="k">Prev. volume</div><div class="v">{fmt_int(qd['prev_volume'])}</div><div class="s">{prev_date}</div></div>
-      </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+
+@st.fragment(run_every=QUOTE_REFRESH_SECONDS)
+def quote_card(sym: str, prof: dict) -> None:
+    """Re-runs itself every minute while the page is open, so prices stay fresh on a phone."""
+    try:
+        qd = get_quote(sym)
+    except Exception as e:
+        st.error(f"Couldn't refresh {sym}: {e}")
+        return
+    updated = datetime.now().strftime("%H:%M:%S")
+    ccy, last = norm_currency(qd["currency"], qd["last"])
+    _, open_ = norm_currency(qd["currency"], qd["open"])
+    _, high = norm_currency(qd["currency"], qd["high"])
+    _, low = norm_currency(qd["currency"], qd["low"])
+    _, prev_close = norm_currency(qd["currency"], qd["prev_close"])
+    _, prev_high = norm_currency(qd["currency"], qd["prev_high"])
+    _, prev_low = norm_currency(qd["currency"], qd["prev_low"])
+    chg = last - prev_close
+    pct = (chg / prev_close * 100) if prev_close else 0.0
+    d = css_dir(chg)
+    prev_date = qd["prev_date"].strftime("%a %d %b") if qd["prev_date"] else "prev. session"
+
+    meta_bits = [b for b in (qd["exchange"], prof["sector"], prof["industry"]) if b]
+    st.markdown(
+        f"""
+        <div class="ps-card">
+          <p class="ps-name">{prof['name']} <span class="ps-meta">· {sym}</span></p>
+          <div class="ps-meta">{' · '.join(meta_bits)} · last trade {qd['as_of'].strftime('%a %d %b %Y %H:%M %Z').strip()} · refreshed {updated}</div>
+          <div style="display:flex;align-items:baseline;gap:1rem;flex-wrap:wrap;margin-top:.6rem;">
+            <div class="ps-price">{fmt_price(last, ccy)}</div>
+            <div class="ps-chg {d}">{arrow(chg)} {chg:+,.2f} ({pct:+.2f}%) today</div>
+          </div>
+          <div class="ps-grid" style="margin-top:1rem;">
+            <div class="ps-tile"><div class="k">Open</div><div class="v">{fmt_price(open_, '')}</div></div>
+            <div class="ps-tile"><div class="k">Day high</div><div class="v up">{fmt_price(high, '')}</div></div>
+            <div class="ps-tile"><div class="k">Day low</div><div class="v down">{fmt_price(low, '')}</div></div>
+            <div class="ps-tile"><div class="k">Volume today</div><div class="v">{fmt_int(qd['volume'])}</div></div>
+            <div class="ps-tile"><div class="k">Prev. close</div><div class="v">{fmt_price(prev_close, '')}</div><div class="s">{prev_date}</div></div>
+            <div class="ps-tile"><div class="k">Prev. high / low</div><div class="v">{fmt_price(prev_high, '')} / {fmt_price(prev_low, '')}</div><div class="s">{prev_date}</div></div>
+            <div class="ps-tile"><div class="k">Prev. volume</div><div class="v">{fmt_int(qd['prev_volume'])}</div><div class="s">{prev_date}</div></div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+
+quote_card(sym, prof)
+ccy, _ = norm_currency(qd["currency"], qd["last"])
 
 # --------------------------------------------------------------------------- #
 # Price chart
@@ -548,10 +665,8 @@ else:
     )
 
     # Manual HEPS capture (JSE-specific; persisted alongside the watchlist)
-    HEPS_FILE = Path(__file__).with_name("heps.json")
-    try:
-        heps_store = json.loads(HEPS_FILE.read_text())
-    except Exception:
+    heps_store = store_load(HEPS_NAME, {})
+    if not isinstance(heps_store, dict):
         heps_store = {}
     with st.expander("HEPS (manual entry)"):
         c1, c2 = st.columns(2)
@@ -559,11 +674,10 @@ else:
         h_prev = c2.number_input(f"HEPS FY{(fin['prev_fy_end'] or '')[-4:]} ({fccy})", value=float(heps_store.get(sym, {}).get("prev", 0.0)), format="%.2f")
         if st.button("Save HEPS"):
             heps_store[sym] = {"cur": h_cur, "prev": h_prev}
-            try:
-                HEPS_FILE.write_text(json.dumps(heps_store, indent=2))
+            if store_save(HEPS_NAME, heps_store):
                 st.success("Saved.")
-            except Exception:
-                st.warning("Couldn't write to disk on this host — value kept for this session only.")
+            else:
+                st.warning("Saved for now, but not durably — set up the Gist storage (see README) to keep it.")
         if h_cur and h_prev:
             hv, hp = yoy(h_cur, h_prev)
             st.markdown(f"**HEPS YoY:** <span class='{css_dir(hv)}'>{hv:+.2f} ({hp:+.1f}%)</span>", unsafe_allow_html=True)

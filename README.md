@@ -55,9 +55,33 @@ PolyShare is a web app, so you install it as a shortcut that opens full-screen l
 1. Open the URL in Chrome.
 2. Tap **⋮** → **Add to Home screen** (or **Install app**) → **Add**.
 
-**Keeping your watchlist in sync across devices:** the watchlist is encoded in the URL (`?w=NPN.JO,SOL.JO,…`).
-After editing your list on one device, copy the URL from the address bar and re-add the shortcut on the other
-device (or just bookmark the new URL). The server also keeps `watchlist.json` as a fallback.
+---
+
+## 2b. Keep your watchlist (one-time, 5 minutes) — **do this**
+
+Streamlit Cloud wipes the app's disk whenever the app sleeps or redeploys, so a watchlist saved only on the
+server is lost overnight. PolyShare therefore stores `watchlist.json` and `heps.json` in a **private GitHub
+Gist** on your account. Once configured, your list survives restarts and is the same on laptop and phone.
+
+1. **Create the gist.** Go to <https://gist.github.com> (signed in). Filename: `watchlist.json`.
+   Content: `[]` (two square brackets). Click **Create secret gist**.
+   Copy the long hex ID from the address bar: `https://gist.github.com/<you>/`**`a1b2c3d4…`**.
+2. **Create a token.** GitHub → your avatar → **Settings → Developer settings → Personal access tokens →
+   Fine-grained tokens → Generate new token**. Name it `polyshare`; expiration: 1 year (or custom, further out).
+   Under **Permissions → Account permissions** set **Gists: Read and write**. No repository access needed.
+   Generate, then copy the token (starts with `github_pat_`) — it's shown only once.
+3. **Give them to the app.** On <https://share.streamlit.io> open your app → **⋮ → Settings → Secrets**, paste:
+   ```toml
+   GIST_ID = "a1b2c3d4…"
+   GITHUB_TOKEN = "github_pat_…"
+   ```
+   Save. The app reboots; the sidebar should now show "✅ Watchlist saved to your private Gist".
+4. Add your shares once more — this time they stick.
+
+Running locally instead? Put the same two lines in `polyshare/.streamlit/secrets.toml` (already git-ignored).
+
+Without these secrets the app still works, but changes only live in the URL (`?w=NPN.JO,SOL.JO,…`) and on the
+server's temporary disk; the sidebar shows a warning to remind you.
 
 ---
 
