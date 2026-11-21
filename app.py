@@ -6,10 +6,13 @@ Ticker conventions: JSE = SYMBOL.JO (e.g. NPN.JO), LSE = .L, ASX = .AX, US = bar
 """
 from __future__ import annotations
 
+import html
 import json
 import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -34,12 +37,35 @@ html, body, [class*="css"] { font-family: 'Inter', -apple-system, system-ui, san
 .block-container { padding-top: 3.2rem; padding-bottom: 3rem; max-width: 1200px; }
 #MainMenu, footer { visibility: hidden; }
 
-.ps-brand { display:flex; align-items:center; gap:.6rem; margin-bottom:.25rem; }
-.ps-logo { width:38px; height:38px; border-radius:11px;
+.ps-brand { display:flex; align-items:center; gap:.7rem; margin-bottom:.5rem; }
+.ps-logo { width:54px; height:54px; border-radius:15px; flex-shrink:0;
   background: linear-gradient(135deg,#6EE7B7 0%,#3B82F6 60%,#8B5CF6 100%);
-  display:flex; align-items:center; justify-content:center; font-weight:800; color:#0B1220; font-size:18px; }
-.ps-title { font-size:1.65rem; font-weight:800; letter-spacing:-0.02em; margin:0; }
-.ps-sub { color:#8B96A8; font-size:.85rem; margin-top:-.2rem; }
+  display:flex; align-items:center; justify-content:center; font-weight:800; color:#0B1220; font-size:26px; }
+/* "p." prefix needed: Streamlit's own paragraph style otherwise wins and pins the title at 16px */
+.ps-brand p.ps-title { font-size:32px; font-weight:800; letter-spacing:-0.02em; margin:0; line-height:1.1; }
+.ps-sub { color:#8B96A8; font-size:.85rem; margin-top:.1rem; }
+
+/* Summary + market tables */
+.ps-scroll { overflow-x:auto; -webkit-overflow-scrolling:touch; }
+table.ps-sum { width:100%; border-collapse:collapse; font-size:.92rem; white-space:nowrap; margin:0; border:none; }
+table.ps-sum th { text-align:right; color:#8B96A8; font-weight:500; font-size:.72rem;
+  text-transform:uppercase; letter-spacing:.06em; padding:.45rem .6rem; border:none;
+  border-bottom:1px solid rgba(255,255,255,.08); }
+table.ps-sum td { text-align:right; padding:.6rem .6rem; border:none; border-bottom:1px solid rgba(255,255,255,.05);
+  font-variant-numeric: tabular-nums; }
+table.ps-sum tr:last-child td { border-bottom:none; }
+table.ps-sum th:first-child, table.ps-sum td:first-child { text-align:left; position:sticky; left:0;
+  background:#0F1728; z-index:1; }
+table.ps-sum .tk { font-weight:700; }
+table.ps-sum .cc { color:#8B96A8; font-size:.7rem; font-weight:500; margin-left:.25rem; }
+table.ps-sum .nm { color:#8B96A8; font-size:.75rem; max-width:170px; overflow:hidden; text-overflow:ellipsis; }
+table.ps-sum .px { font-weight:700; }
+table.ps-sum td.err { text-align:left; color:#F87171; font-size:.8rem; }
+@media (max-width: 640px) {
+  table.ps-sum { font-size:.85rem; }
+  table.ps-sum th, table.ps-sum td { padding:.5rem .45rem; }
+  table.ps-sum .nm { max-width:105px; }
+}
 
 .ps-card { background: linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.015));
   border:1px solid rgba(255,255,255,.08); border-radius:16px; padding:1.1rem 1.25rem; margin-bottom:1rem; }
@@ -162,10 +188,23 @@ def _save_watchlist(wl: list[str]) -> None:
     store_save(WL_NAME, wl)
 
 
+SUMMARY = "__summary__"          # the "Summary" tab in the selector row
+LOCAL_TZ = ZoneInfo("Africa/Johannesburg")
+REFRESH_SECONDS = 60              # summary + quote card re-fetch while the page is open
+
+# Market updates table: (label, Yahoo symbol, unit shown under the label, decimals)
+MARKETS = [
+    ("Gold", "GC=F", "USD per ounce", 2),
+    ("Crude oil (Brent)", "BZ=F", "USD per barrel", 2),
+    ("USD / ZAR", "USDZAR=X", "Rand per US$1", 4),
+    ("EUR / ZAR", "EURZAR=X", "Rand per €1", 4),
+    ("Bitcoin", "BTC-USD", "USD per bitcoin", 2),
+]
+
 if "watchlist" not in st.session_state:
     st.session_state.watchlist = _load_watchlist()
 if "selected" not in st.session_state:
-    st.session_state.selected = st.session_state.watchlist[0] if st.session_state.watchlist else None
+    st.session_state.selected = SUMMARY   # always open on the Summary page
 
 # --------------------------------------------------------------------------- #
 # Data layer (cached)
@@ -182,9 +221,9 @@ PERIODS = {
 }
 
 
-@st.cache_data(ttl=30, show_spinner=False)
-def get_quote(symbol: str) -> dict:
-    """Live quote (fast_info) + last trade time (1-min bars) + previous-session figures (daily bars)."""
+def _fetch_quote(symbol: str) -> dict:
+    """Live quote (fast_info) + last trade time (1-min bars) + previous-session figures (daily bars).
+    Uncached so it can run in worker threads; use get_quote / get_quotes from the UI."""
     t = yf.Ticker(symbol)
 
     # --- live quote fields -------------------------------------------------
@@ -252,6 +291,39 @@ def get_quote(symbol: str) -> dict:
     }
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def get_quote(symbol: str) -> dict:
+    return _fetch_quote(symbol)
+
+
+def _run_parallel(fn, symbols, workers: int = 6) -> dict:
+    """Call fn(symbol) for each symbol in a small thread pool. Failures come back as {"error": "..."}."""
+    out = {}
+    if not symbols:
+        return out
+    with ThreadPoolExecutor(max_workers=min(workers, len(symbols))) as ex:
+        futs = {ex.submit(fn, s): s for s in symbols}
+        for fut in as_completed(futs):
+            s = futs[fut]
+            try:
+                out[s] = fut.result()
+            except Exception as e:
+                out[s] = {"error": str(e) or type(e).__name__}
+    return out
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_quotes(symbols: tuple[str, ...]) -> dict:
+    """Quotes for many symbols at once (Summary page) — fetched in parallel."""
+    return _run_parallel(_fetch_quote, symbols)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_names(symbols: tuple[str, ...]) -> dict:
+    res = _run_parallel(_fetch_profile, symbols)
+    return {s: (r.get("name") or s) if "error" not in r else s for s, r in res.items()}
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def get_history(symbol: str, period_key: str) -> pd.DataFrame:
     period, interval = PERIODS[period_key]
@@ -260,7 +332,15 @@ def get_history(symbol: str, period_key: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_profile(symbol: str) -> dict:
+def get_daily(symbol: str) -> pd.DataFrame:
+    """~11.5 years of daily bars: feeds the 30-day / 1-year averages (even on the 10Y chart,
+    whose first point needs a year of history before it) and the 1-year high/low."""
+    start = (pd.Timestamp.today() - pd.DateOffset(years=11, months=6)).strftime("%Y-%m-%d")
+    df = yf.Ticker(symbol).history(start=start, interval="1d", auto_adjust=False)
+    return df.dropna(subset=["Close"])
+
+
+def _fetch_profile(symbol: str) -> dict:
     try:
         info = yf.Ticker(symbol).info or {}
     except Exception:
@@ -275,6 +355,11 @@ def get_profile(symbol: str) -> dict:
         "employees": info.get("fullTimeEmployees"),
         "fin_currency": info.get("financialCurrency") or "",
     }
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_profile(symbol: str) -> dict:
+    return _fetch_profile(symbol)
 
 
 FIN_ROWS = [
@@ -395,6 +480,110 @@ def arrow(v: float | None) -> str:
     return "▲" if v > 0 else "▼"
 
 
+def to_local(dt) -> datetime | None:
+    """Show times in South African time regardless of the server's (UTC) clock or the exchange's zone."""
+    if dt is None:
+        return None
+    if getattr(dt, "tzinfo", None) is None:
+        dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+    return dt.astimezone(LOCAL_TZ)
+
+
+def _utc_index(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    return idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
+
+
+def one_year_range(symbol: str, qd: dict):
+    """52-week high/low (intraday highs/lows) with dates, in the quote's raw units (e.g. ZAc).
+    Today's live high/low is included because JSE daily bars only post after the close."""
+    hi = lo = hi_d = lo_d = None
+    try:
+        daily = get_daily(symbol)
+    except Exception:
+        daily = pd.DataFrame()
+    if not daily.empty:
+        since = pd.Timestamp.now(tz=daily.index.tz) - pd.Timedelta(days=365)
+        yr = daily[daily.index > since]
+        highs = yr["High"][yr["High"] > 0]
+        lows = yr["Low"][yr["Low"] > 0]          # Yahoo occasionally reports a 0 low on JSE bars
+        if not highs.empty:
+            hi, hi_d = float(highs.max()), highs.idxmax().to_pydatetime()
+        if not lows.empty:
+            lo, lo_d = float(lows.min()), lows.idxmin().to_pydatetime()
+    if qd.get("high") and (hi is None or qd["high"] > hi):
+        hi, hi_d = qd["high"], qd["as_of"]
+    if qd.get("low") and (lo is None or qd["low"] < lo):
+        lo, lo_d = qd["low"], qd["as_of"]
+    return hi, hi_d, lo, lo_d
+
+
+def moving_averages(daily: pd.DataFrame, scale: float) -> pd.DataFrame:
+    """30-day average = last 30 trading sessions; 1-year average = last 365 calendar days.
+    The 1-year line is only drawn once a full year of history exists."""
+    close = daily["Close"] * scale
+    ma30 = close.rolling(30, min_periods=30).mean()
+    ma1y = close.rolling("365D").mean()
+    ma1y[close.index < close.index[0] + pd.Timedelta(days=364)] = float("nan")
+    return pd.DataFrame({"ma30": ma30, "ma1y": ma1y})
+
+
+def _sum_row_label(sym: str, ccy: str, name: str) -> str:
+    cc = f"<span class='cc'>{ccy}</span>" if ccy else ""
+    nm = f"<div class='nm'>{html.escape(name)}</div>" if name and name != sym else ""
+    return f"<td><div class='tk'>{html.escape(sym)}{cc}</div>{nm}</td>"
+
+
+def watchlist_table(symbols, quotes: dict, names: dict) -> str:
+    head = ("<tr><th>Share</th><th>Price</th><th>Day high</th><th>Day low</th><th>Prev. close</th>"
+            "<th>Prev. high</th><th>Prev. low</th><th>Volume today</th><th>Prev. volume</th></tr>")
+    rows = ""
+    for s in symbols:
+        q = quotes.get(s) or {"error": "no data"}
+        name = names.get(s, s)
+        if "error" in q:
+            rows += ("<tr>" + _sum_row_label(s, "", name) +
+                     f"<td colspan='8' class='err'>Couldn't load: {html.escape(q['error'][:90])}</td></tr>")
+            continue
+        ccy, last = norm_currency(q["currency"], q["last"])
+        n = lambda v: norm_currency(q["currency"], v)[1]
+        prev_close = n(q["prev_close"])
+        d = css_dir(None if last is None or prev_close is None else last - prev_close)
+        rows += (
+            "<tr>" + _sum_row_label(s, ccy, name) +
+            f"<td class='px {d}'>{fmt_price(last)}</td>"
+            f"<td>{fmt_price(n(q['high']))}</td><td>{fmt_price(n(q['low']))}</td>"
+            f"<td>{fmt_price(prev_close)}</td>"
+            f"<td>{fmt_price(n(q['prev_high']))}</td><td>{fmt_price(n(q['prev_low']))}</td>"
+            f"<td>{fmt_int(q['volume'])}</td><td>{fmt_int(q['prev_volume'])}</td></tr>"
+        )
+    return (f"<div class='ps-card ps-scroll'><table class='ps-sum'><thead>{head}</thead>"
+            f"<tbody>{rows}</tbody></table></div>")
+
+
+def market_table(quotes: dict) -> str:
+    head = "<tr><th>Market</th><th>Price</th><th>Change</th><th>Change %</th><th>Last update</th></tr>"
+    rows = ""
+    for label, sym, unit, dp in MARKETS:
+        q = quotes.get(sym) or {"error": "no data"}
+        lab = (f"<td><div class='tk'>{label}</div><div class='nm'>{unit}</div></td>")
+        if "error" in q:
+            rows += f"<tr>{lab}<td colspan='4' class='err'>Couldn't load: {html.escape(q['error'][:90])}</td></tr>"
+            continue
+        last, prev = q["last"], q["prev_close"]
+        chg = (last - prev) if (last is not None and prev) else None
+        pct = (chg / prev * 100) if chg is not None else None
+        d = css_dir(chg)
+        when = to_local(q["as_of"])
+        rows += (
+            f"<tr>{lab}<td class='px'>{'—' if last is None else f'{last:,.{dp}f}'}</td>"
+            f"<td class='{d}'>{'—' if chg is None else f'{arrow(chg)} {chg:+,.{dp}f}'}</td>"
+            f"<td class='{d}'>{'—' if pct is None else f'{pct:+.2f}%'}</td>"
+            f"<td>{when.strftime('%a %H:%M') if when else '—'}</td></tr>"
+        )
+    return (f"<div class='ps-card ps-scroll'><table class='ps-sum'><thead>{head}</thead>"
+            f"<tbody>{rows}</tbody></table></div>")
+
+
 # --------------------------------------------------------------------------- #
 # Header
 # --------------------------------------------------------------------------- #
@@ -448,7 +637,7 @@ with st.sidebar:
             st.session_state.watchlist.remove(sym)
             _save_watchlist(st.session_state.watchlist)
             if st.session_state.selected == sym:
-                st.session_state.selected = st.session_state.watchlist[0] if st.session_state.watchlist else None
+                st.session_state.selected = SUMMARY
             st.rerun()
 
     st.divider()
@@ -468,23 +657,62 @@ with st.sidebar:
 # Watchlist selector
 # --------------------------------------------------------------------------- #
 wl = st.session_state.watchlist
-if not wl:
-    st.info("Your watchlist is empty. Open the sidebar (top-left ›) to add shares.")
-    st.stop()
-
-if st.session_state.selected not in wl:
-    st.session_state.selected = wl[0]
+if st.session_state.selected != SUMMARY and st.session_state.selected not in wl:
+    st.session_state.selected = SUMMARY
 
 chosen = st.pills(
     "Watchlist",
-    wl,
+    [SUMMARY] + wl,
     selection_mode="single",
     default=st.session_state.selected,
+    format_func=lambda o: "📊 Summary" if o == SUMMARY else o,
     label_visibility="collapsed",
 )
 if chosen and chosen != st.session_state.selected:
     st.session_state.selected = chosen
 sym = st.session_state.selected
+
+
+def footer() -> None:
+    st.markdown(
+        "<div class='ps-note' style='margin-top:1.5rem'>Prices may be delayed by 15–20 minutes depending on the exchange. "
+        "Data: Yahoo Finance via yfinance. Not investment advice.</div>",
+        unsafe_allow_html=True,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Summary page (opens by default)
+# --------------------------------------------------------------------------- #
+@st.fragment(run_every=REFRESH_SECONDS)
+def summary_page(symbols: tuple[str, ...]) -> None:
+    """Re-runs itself every minute while open, like the quote card."""
+    market_syms = tuple(m[1] for m in MARKETS)
+    with st.spinner("Fetching prices…"):
+        quotes = get_quotes(symbols + market_syms)
+        names = get_names(symbols) if symbols else {}
+    updated = datetime.now(LOCAL_TZ).strftime("%H:%M:%S")
+
+    st.markdown('<div class="ps-section">Watchlist summary</div>', unsafe_allow_html=True)
+    if symbols:
+        st.markdown(watchlist_table(symbols, quotes, names), unsafe_allow_html=True)
+    else:
+        st.info("Your watchlist is empty. Open the sidebar (top-left ›) to add shares.")
+
+    st.markdown('<div class="ps-section">Market updates</div>', unsafe_allow_html=True)
+    st.markdown(market_table(quotes), unsafe_allow_html=True)
+    st.markdown(
+        f"<div class='ps-note'>Refreshed {updated} (SA time) · updates every minute · "
+        "tap a share above for its chart and details. Previous = previous trading session; "
+        "change on the market rows is against the previous close.</div>",
+        unsafe_allow_html=True,
+    )
+
+
+if sym == SUMMARY:
+    summary_page(tuple(wl))
+    footer()
+    st.stop()
 
 # --------------------------------------------------------------------------- #
 # Quote summary
@@ -497,10 +725,7 @@ except Exception as e:
     st.error(f"Couldn't load **{sym}**: {e}. Check the ticker (JSE shares need the `.JO` suffix).")
     st.stop()
 
-QUOTE_REFRESH_SECONDS = 60
-
-
-@st.fragment(run_every=QUOTE_REFRESH_SECONDS)
+@st.fragment(run_every=REFRESH_SECONDS)
 def quote_card(sym: str, prof: dict) -> None:
     """Re-runs itself every minute while the page is open, so prices stay fresh on a phone."""
     try:
@@ -508,7 +733,12 @@ def quote_card(sym: str, prof: dict) -> None:
     except Exception as e:
         st.error(f"Couldn't refresh {sym}: {e}")
         return
-    updated = datetime.now().strftime("%H:%M:%S")
+    updated = datetime.now(LOCAL_TZ).strftime("%H:%M:%S")
+    yr_hi, yr_hi_d, yr_lo, yr_lo_d = one_year_range(sym, qd)
+    _, yr_hi = norm_currency(qd["currency"], yr_hi)
+    _, yr_lo = norm_currency(qd["currency"], yr_lo)
+    yr_hi_s = yr_hi_d.strftime("%d %b %Y") if yr_hi_d else "last 12 months"
+    yr_lo_s = yr_lo_d.strftime("%d %b %Y") if yr_lo_d else "last 12 months"
     ccy, last = norm_currency(qd["currency"], qd["last"])
     _, open_ = norm_currency(qd["currency"], qd["open"])
     _, high = norm_currency(qd["currency"], qd["high"])
@@ -539,6 +769,8 @@ def quote_card(sym: str, prof: dict) -> None:
             <div class="ps-tile"><div class="k">Prev. close</div><div class="v">{fmt_price(prev_close, '')}</div><div class="s">{prev_date}</div></div>
             <div class="ps-tile"><div class="k">Prev. high / low</div><div class="v">{fmt_price(prev_high, '')} / {fmt_price(prev_low, '')}</div><div class="s">{prev_date}</div></div>
             <div class="ps-tile"><div class="k">Prev. volume</div><div class="v">{fmt_int(qd['prev_volume'])}</div><div class="s">{prev_date}</div></div>
+            <div class="ps-tile"><div class="k">1-year high</div><div class="v up">{fmt_price(yr_hi, '')}</div><div class="s">{yr_hi_s}</div></div>
+            <div class="ps-tile"><div class="k">1-year low</div><div class="v down">{fmt_price(yr_lo, '')}</div><div class="s">{yr_lo_s}</div></div>
           </div>
         </div>
         """,
@@ -574,25 +806,58 @@ else:
     color = "#34D399" if pchg >= 0 else "#F87171"
     rgba = "rgba(52,211,153,.15)" if pchg >= 0 else "rgba(248,113,113,.15)"
 
+    # Rolling averages are always computed from DAILY closes, then laid over whatever bar size the
+    # chart uses (hourly for 1W, daily for 1M–1Y, weekly for 3Y+).
+    ma = pd.DataFrame()
+    try:
+        daily = get_daily(sym)
+        if not daily.empty:
+            ma = moving_averages(daily, scale)
+    except Exception:
+        pass
+    if not ma.empty:
+        if period == "1W":   # step each day's average across that day's hourly bars
+            m = ma.copy()
+            m.index = _utc_index(m.index)
+            ma = m.reindex(_utc_index(hist.index), method="ffill")
+            ma.index = hist.index
+        else:
+            ma = ma[_utc_index(ma.index) >= _utc_index(hist.index[:1])[0]]
+
+    lo_vals, hi_vals = [float(y.min())], [float(y.max())]
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=hist.index, y=y, mode="lines", name="Close",
+        x=hist.index, y=y, mode="lines", name="Price",
         line=dict(color=color, width=2.2), fill="tozeroy", fillcolor=rgba,
-        hovertemplate="%{x|%d %b %Y %H:%M}<br>" + ccy + " %{y:,.2f}<extra></extra>",
+        hovertemplate=ccy + " %{y:,.2f}",
     ))
+    for col, label, lcolor, dash in (("ma30", "30-day avg", "#FBBF24", "solid"),
+                                     ("ma1y", "1-year avg", "#A78BFA", "dash")):
+        if ma.empty or ma[col].dropna().empty:
+            continue
+        fig.add_trace(go.Scatter(
+            x=ma.index, y=ma[col], mode="lines", name=label, connectgaps=False,
+            line=dict(color=lcolor, width=1.6, dash=dash),
+            hovertemplate=ccy + " %{y:,.2f}",
+        ))
+        lo_vals.append(float(ma[col].min()))
+        hi_vals.append(float(ma[col].max()))
     fig.add_trace(go.Bar(
-        x=hist.index, y=hist["Volume"], name="Volume", yaxis="y2",
-        marker_color="rgba(139,150,168,.35)", hovertemplate="Vol %{y:,.0f}<extra></extra>",
+        x=hist.index, y=hist["Volume"], name="Volume", yaxis="y2", showlegend=False,
+        marker_color="rgba(139,150,168,.35)", hovertemplate="%{y:,.0f}",
     ))
     fig.update_layout(
-        height=420, margin=dict(l=10, r=10, t=30, b=10),
+        height=440, margin=dict(l=10, r=10, t=30, b=10),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         font=dict(family="Inter, sans-serif", color="#C9D1DE"),
-        hovermode="x unified", showlegend=False,
+        hovermode="x unified", showlegend=True,
+        legend=dict(orientation="h", yanchor="top", y=-0.08, xanchor="left", x=0,
+                    bgcolor="rgba(0,0,0,0)", font=dict(size=12)),
         title=dict(text=f"{period}: {pchg:+,.2f} ({ppct:+.2f}%)", font=dict(size=14, color=color), x=0),
-        xaxis=dict(showgrid=False, rangeslider=dict(visible=False)),
+        xaxis=dict(showgrid=False, rangeslider=dict(visible=False),
+                   hoverformat="%d %b %Y %H:%M" if period == "1W" else "%d %b %Y"),
         yaxis=dict(title=ccy, gridcolor="rgba(255,255,255,.06)", zeroline=False,
-                   range=[float(y.min()) * 0.97, float(y.max()) * 1.02]),
+                   range=[min(lo_vals) * 0.97, max(hi_vals) * 1.02]),
         yaxis2=dict(overlaying="y", side="right", showgrid=False, showticklabels=False,
                     range=[0, float(hist["Volume"].max()) * 4]),
     )
@@ -682,8 +947,4 @@ else:
             hv, hp = yoy(h_cur, h_prev)
             st.markdown(f"**HEPS YoY:** <span class='{css_dir(hv)}'>{hv:+.2f} ({hp:+.1f}%)</span>", unsafe_allow_html=True)
 
-st.markdown(
-    "<div class='ps-note' style='margin-top:1.5rem'>Prices may be delayed by 15–20 minutes depending on the exchange. "
-    "Data: Yahoo Finance via yfinance. Not investment advice.</div>",
-    unsafe_allow_html=True,
-)
+footer()

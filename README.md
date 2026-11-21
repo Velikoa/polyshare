@@ -97,11 +97,16 @@ Open <http://localhost:8501>. On the same Wi-Fi, your phone can open the "Networ
 
 ## 4. Using the app
 
-- **Watchlist chips** at the top — tap a share to load it.
+- **Summary (opens by default)** — the first chip. One table of every share in the watchlist: price, day high/low,
+  previous close, previous high/low, today's volume and previous volume. Below it, **Market updates**: gold (Comex
+  futures, USD/oz), Brent crude (USD/bbl), USD/ZAR, EUR/ZAR and Bitcoin (USD). Refreshes every minute. On a phone,
+  swipe the tables sideways; the share column stays pinned.
+- **Watchlist chips** at the top — tap a share to load its detail page.
 - **Sidebar (› top-left)** — search by company name or ticker and add; ✕ to remove; ↻ to refresh data.
 - **Ticker format:** JSE `NPN.JO`, `SOL.JO`, `SBK.JO`; LSE `.L`; ASX `.AX`; US bare (`AAPL`).
-- **Quote card:** price, day move (R and %), open, day high/low, volume, previous close, previous high/low, previous volume.
-- **Chart:** 1W, 1M, 3M, 6M, 1Y, 3Y, 5Y, 10Y with volume bars.
+- **Quote card:** price, day move (R and %), open, day high/low, volume, previous close, previous high/low, previous volume, 1-year high and low (with dates).
+- **Chart:** 1W, 1M, 3M, 6M, 1Y, 3Y, 5Y, 10Y with volume bars, a 30-day average (last 30 trading days) and a
+  1-year average (last 12 months), both from daily closes. Tap a legend entry to hide/show a line.
 - **Latest annual results:** revenue, operating expenses, operating profit, profit for the year, basic & diluted EPS, each with YoY movement and %.
 - **HEPS:** headline EPS is a JSE/SAICA measure that Yahoo doesn't publish. Capture it from the SENS results announcement in the *HEPS (manual entry)* expander; the app stores it in `heps.json` and shows the YoY movement.
 
